@@ -73,6 +73,7 @@ package klog
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"errors"
 	"flag"
 	"fmt"
@@ -699,8 +700,31 @@ func (l *loggingT) println(s severity, logr logr.Logger, args ...interface{}) {
 	l.output(s, logr, buf, file, line, false)
 }
 
+func (l *loggingT) printlnPrefix(s severity, logr logr.Logger, prefix interface{}, args ...interface{}) {
+	buf, file, line := l.header(s, 0)
+	// if logr is set, we clear the generated header as we rely on the backing
+	// logr implementation to print headers
+	if logr != nil {
+		l.putBuffer(buf)
+		buf = l.getBuffer()
+	}
+	if prefix != nil {
+		fmt.Fprint(buf, prefix)
+		lastChr := buf.Bytes()[buf.Len()-1]
+		if lastChr != ' ' && lastChr != '\t' {
+			buf.WriteByte(' ')
+		}
+	}
+	fmt.Fprintln(buf, args...)
+	l.output(s, logr, buf, file, line, false)
+}
+
 func (l *loggingT) print(s severity, logr logr.Logger, args ...interface{}) {
 	l.printDepth(s, logr, 1, args...)
+}
+
+func (l *loggingT) printPrefix(s severity, logr logr.Logger, prefix interface{}, args ...interface{}) {
+	l.printDepthAndPrefix(s, logr, 1, prefix, args...)
 }
 
 func (l *loggingT) printDepth(s severity, logr logr.Logger, depth int, args ...interface{}) {
@@ -710,6 +734,28 @@ func (l *loggingT) printDepth(s severity, logr logr.Logger, depth int, args ...i
 	if logr != nil {
 		l.putBuffer(buf)
 		buf = l.getBuffer()
+	}
+	fmt.Fprint(buf, args...)
+	if buf.Bytes()[buf.Len()-1] != '\n' {
+		buf.WriteByte('\n')
+	}
+	l.output(s, logr, buf, file, line, false)
+}
+
+func (l *loggingT) printDepthAndPrefix(s severity, logr logr.Logger, depth int, prefix interface{}, args ...interface{}) {
+	buf, file, line := l.header(s, depth)
+	// if logr is set, we clear the generated header as we rely on the backing
+	// logr implementation to print headers
+	if logr != nil {
+		l.putBuffer(buf)
+		buf = l.getBuffer()
+	}
+	if prefix != nil {
+		fmt.Fprint(buf, prefix)
+		lastChr := buf.Bytes()[buf.Len()-1]
+		if lastChr != ' ' && lastChr != '\t' {
+			buf.WriteByte(' ')
+		}
 	}
 	fmt.Fprint(buf, args...)
 	if buf.Bytes()[buf.Len()-1] != '\n' {
@@ -760,6 +806,15 @@ func (l *loggingT) errorS(err error, loggr logr.Logger, msg string, keysAndValue
 	l.printS(err, msg, keysAndValues...)
 }
 
+// if loggr is specified, will call loggr.Error, otherwise output with logging module.
+func (l *loggingT) errorSAndPrefix(err error, loggr logr.Logger, prefix interface{}, msg string, keysAndValues ...interface{}) {
+	if loggr != nil {
+		loggr.Error(err, msg, keysAndValues)
+		return
+	}
+	l.printSAndPrefix(err, prefix, msg, keysAndValues...)
+}
+
 // if loggr is specified, will call loggr.Info, otherwise output with logging module.
 func (l *loggingT) infoS(loggr logr.Logger, msg string, keysAndValues ...interface{}) {
 	if loggr != nil {
@@ -767,6 +822,15 @@ func (l *loggingT) infoS(loggr logr.Logger, msg string, keysAndValues ...interfa
 		return
 	}
 	l.printS(nil, msg, keysAndValues...)
+}
+
+// if loggr is specified, will call loggr.Info, otherwise output with logging module.
+func (l *loggingT) infoSAndPrefix(loggr logr.Logger, prefix interface{}, msg string, keysAndValues ...interface{}) {
+	if loggr != nil {
+		loggr.Info(msg, keysAndValues)
+		return
+	}
+	l.printSAndPrefix(nil, prefix, msg, keysAndValues...)
 }
 
 // printS is called from infoS and errorS if loggr is not specified.
@@ -786,6 +850,23 @@ func (l *loggingT) printS(err error, msg string, keysAndValues ...interface{}) {
 		s = errorLog
 	}
 	l.printDepth(s, logging.logr, 2, b)
+}
+
+func (l *loggingT) printSAndPrefix(err error, prefix interface{}, msg string, keysAndValues ...interface{}) {
+	b := &bytes.Buffer{}
+	b.WriteString(fmt.Sprintf("%q", msg))
+	if err != nil {
+		b.WriteByte(' ')
+		b.WriteString(fmt.Sprintf("err=%q", err.Error()))
+	}
+	kvListFormat(b, keysAndValues...)
+	var s severity
+	if err == nil {
+		s = infoLog
+	} else {
+		s = errorLog
+	}
+	l.printDepthAndPrefix(s, logging.logr, 2, prefix, b)
 }
 
 const missingValue = "(MISSING)"
@@ -1232,13 +1313,14 @@ func (l *loggingT) setV(pc uintptr) Level {
 type Verbose struct {
 	enabled bool
 	logr    logr.Logger
+	ctx context.Context
 }
 
 func newVerbose(level Level, b bool) Verbose {
 	if logging.logr == nil {
-		return Verbose{b, nil}
+		return Verbose{b, nil, nil}
 	}
-	return Verbose{b, logging.logr.V(int(level))}
+	return Verbose{b, logging.logr.V(int(level)), nil}
 }
 
 // V reports whether verbosity at the call site is at least the requested level.
@@ -1296,7 +1378,11 @@ func (v Verbose) Enabled() bool {
 // See the documentation of V for usage.
 func (v Verbose) Info(args ...interface{}) {
 	if v.enabled {
-		logging.print(infoLog, v.logr, args...)
+		if v.ctx == nil {
+			logging.print(infoLog, v.logr, args...)
+		} else {
+			logging.printPrefix(infoLog, v.logr, v.ctx.Value(ContextKey), args...)
+		}
 	}
 }
 
@@ -1304,7 +1390,11 @@ func (v Verbose) Info(args ...interface{}) {
 // See the documentation of V for usage.
 func (v Verbose) Infoln(args ...interface{}) {
 	if v.enabled {
-		logging.println(infoLog, v.logr, args...)
+		if v.ctx == nil {
+			logging.println(infoLog, v.logr, args...)
+		} else {
+			logging.printlnPrefix(infoLog, v.logr, v.ctx.Value(ContextKey), args...)
+		}
 	}
 }
 
@@ -1312,6 +1402,9 @@ func (v Verbose) Infoln(args ...interface{}) {
 // See the documentation of V for usage.
 func (v Verbose) Infof(format string, args ...interface{}) {
 	if v.enabled {
+		if v.ctx != nil {
+			format = fmt.Sprintf("%s %s", v.ctx.Value(ContextKey), format)
+		}
 		logging.printf(infoLog, v.logr, format, args...)
 	}
 }
@@ -1320,7 +1413,11 @@ func (v Verbose) Infof(format string, args ...interface{}) {
 // See the documentation of V for usage.
 func (v Verbose) InfoS(msg string, keysAndValues ...interface{}) {
 	if v.enabled {
-		logging.infoS(v.logr, msg, keysAndValues...)
+		if v.ctx != nil {
+			logging.infoSAndPrefix(v.logr, v.ctx.Value(ContextKey), msg, keysAndValues...)
+		} else {
+			logging.infoS(v.logr, msg, keysAndValues...)
+		}
 	}
 }
 
@@ -1328,7 +1425,11 @@ func (v Verbose) InfoS(msg string, keysAndValues ...interface{}) {
 // See the documentation of V for usage.
 func (v Verbose) Error(err error, msg string, args ...interface{}) {
 	if v.enabled {
-		logging.errorS(err, v.logr, msg, args...)
+		if v.ctx != nil {
+			logging.errorSAndPrefix(err, v.logr, v.ctx.Value(ContextKey), msg, args...)
+		} else {
+			logging.errorS(err, v.logr, msg, args...)
+		}
 	}
 }
 
@@ -1522,4 +1623,120 @@ func KRef(namespace, name string) ObjectRef {
 		Name:      name,
 		Namespace: namespace,
 	}
+}
+
+const ContextKey = "__log_context_key__"
+
+type ContextLogger struct {
+	ctx context.Context
+}
+
+func Context(ctx context.Context) ContextLogger {
+	if ctx == nil {
+		ctx = context.TODO()
+	}
+	return ContextLogger{ctx}
+}
+
+func (cl ContextLogger) V(level Level) Verbose {
+	verbose := V(level)
+	verbose.ctx = cl.ctx
+	return verbose
+}
+
+func (cl ContextLogger) Info(args ...interface{}) {
+	logging.printPrefix(infoLog, logging.logr, cl.ctx.Value(ContextKey), args...)
+}
+
+func (cl ContextLogger) InfoDepth(depth int, args ...interface{}) {
+	logging.printDepthAndPrefix(infoLog, logging.logr, depth, cl.ctx.Value(ContextKey), args...)
+}
+
+func (cl ContextLogger) Infoln(args ...interface{}) {
+	logging.printlnPrefix(infoLog, logging.logr, cl.ctx.Value(ContextKey), args...)
+}
+
+func (cl ContextLogger) Infof(format string, args ...interface{}) {
+	format = fmt.Sprintf("%s %s", cl.ctx.Value(ContextKey), format)
+	logging.printf(infoLog, logging.logr, format, args...)
+}
+
+func (cl ContextLogger) InfoS(msg string, keysAndValues ...interface{}) {
+	logging.infoSAndPrefix(logging.logr, cl.ctx.Value(ContextKey), msg, keysAndValues...)
+}
+
+func (cl ContextLogger) Warning(args ...interface{}) {
+	logging.printPrefix(warningLog, logging.logr, cl.ctx.Value(ContextKey), args...)
+}
+
+func (cl ContextLogger) WarningDepth(depth int, args ...interface{}) {
+	logging.printDepthAndPrefix(warningLog, logging.logr, depth, cl.ctx.Value(ContextKey), args...)
+}
+
+func (cl ContextLogger) Warningln(args ...interface{}) {
+	logging.printlnPrefix(warningLog, logging.logr, cl.ctx.Value(ContextKey), args...)
+}
+
+func (cl ContextLogger) Warningf(format string, args ...interface{}) {
+	format = fmt.Sprintf("%s %s", cl.ctx.Value(ContextKey), format)
+	logging.printf(warningLog, logging.logr, format, args...)
+}
+
+func (cl ContextLogger) Error(args ...interface{}) {
+	logging.printPrefix(errorLog, logging.logr, cl.ctx.Value(ContextKey), args...)
+}
+
+func (cl ContextLogger) ErrorDepth(depth int, args ...interface{}) {
+	logging.printDepthAndPrefix(errorLog, logging.logr, depth, cl.ctx.Value(ContextKey), args...)
+}
+
+func (cl ContextLogger) Errorln(args ...interface{}) {
+	logging.printlnPrefix(errorLog, logging.logr, cl.ctx.Value(ContextKey), args...)
+}
+
+func (cl ContextLogger) Errorf(format string, args ...interface{}) {
+	format = fmt.Sprintf("%s %s", cl.ctx.Value(ContextKey), format)
+	logging.printf(errorLog, logging.logr, format, args...)
+}
+
+func (cl ContextLogger) ErrorS(err error, msg string, keysAndValues ...interface{}) {
+	logging.errorSAndPrefix(err, logging.logr, cl.ctx.Value(ContextKey), msg, keysAndValues...)
+}
+
+func (cl ContextLogger) Fatal(args ...interface{}) {
+	logging.printPrefix(fatalLog, logging.logr, cl.ctx.Value(ContextKey), args...)
+}
+
+func (cl ContextLogger) FatalDepth(depth int, args ...interface{}) {
+	logging.printDepthAndPrefix(fatalLog, logging.logr, depth, cl.ctx.Value(ContextKey), args...)
+}
+
+func (cl ContextLogger) Fatalln(args ...interface{}) {
+	logging.printlnPrefix(fatalLog, logging.logr, cl.ctx.Value(ContextKey), args...)
+}
+
+func (cl ContextLogger) Fatalf(format string, args ...interface{}) {
+	format = fmt.Sprintf("%s %s", cl.ctx.Value(ContextKey), format)
+	logging.printf(fatalLog, logging.logr, format, args...)
+}
+
+func (cl ContextLogger) Exit(args ...interface{}) {
+	atomic.StoreUint32(&fatalNoStacks, 1)
+	logging.printPrefix(fatalLog, logging.logr, cl.ctx.Value(ContextKey), args...)
+}
+
+func (cl ContextLogger) ExitDepth(depth int, args ...interface{}) {
+	atomic.StoreUint32(&fatalNoStacks, 1)
+	logging.printDepthAndPrefix(fatalLog, logging.logr, depth, cl.ctx.Value(ContextKey), args...)
+}
+
+func (cl ContextLogger) Exitln(args ...interface{}) {
+	atomic.StoreUint32(&fatalNoStacks, 1)
+	logging.printlnPrefix(fatalLog, logging.logr, cl.ctx.Value(ContextKey), args...)
+}
+
+func (cl ContextLogger) Exitf(format string, args ...interface{}) {
+	atomic.StoreUint32(&fatalNoStacks, 1)
+	format = fmt.Sprintf("%s %s", cl.ctx.Value(ContextKey), format)
+	logging.printf(fatalLog, logging.logr, format, args...)
 }
