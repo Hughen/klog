@@ -1625,7 +1625,8 @@ func KRef(namespace, name string) ObjectRef {
 	}
 }
 
-const ContextKey = "__log_context_key__"
+type LogContextKey string
+const ContextKey LogContextKey = "__log_context_key__"
 
 type ContextLogger struct {
 	ctx context.Context
